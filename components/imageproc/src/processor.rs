@@ -53,15 +53,16 @@ impl ImageOp {
             None => img,
         };
 
-        let f = File::create(&self.output_path)?;
-        let mut buffered_f = BufWriter::new(f);
+        let get_writer =
+            || Ok::<_, std::io::Error>(BufWriter::new(File::create(&self.output_path)?));
 
         match self.format {
             Format::Png => {
-                img.write_to(&mut buffered_f, ImageFormat::Png)?;
+                img.write_to(&mut get_writer()?, ImageFormat::Png)?;
             }
             Format::Jpeg { quality } => {
-                let mut encoder = JpegEncoder::new_with_quality(&mut buffered_f, quality);
+                let mut writer = get_writer()?;
+                let mut encoder = JpegEncoder::new_with_quality(&mut writer, quality);
                 encoder.encode_image(&img)?;
             }
             Format::WebP { quality } => {
@@ -71,7 +72,7 @@ impl ImageOp {
                     Some(q) => encoder.encode(q as f32),
                     None => encoder.encode_lossless(),
                 };
-                buffered_f.write_all(memory.as_bytes())?;
+                get_writer()?.write_all(memory.as_bytes())?;
             }
             Format::Avif { quality, speed } => {
                 let mut avif: Vec<u8> = Vec::new();
@@ -95,7 +96,7 @@ impl ImageOp {
                     img.dimensions().1,
                     color_type,
                 )?;
-                buffered_f.write_all(&avif.as_bytes())?;
+                get_writer()?.write_all(&avif.as_bytes())?;
             }
         }
 
