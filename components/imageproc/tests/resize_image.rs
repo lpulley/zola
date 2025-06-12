@@ -517,7 +517,12 @@ fn fix_orientation_test() {
     fn load_img_and_fix_orientation(img_name: &str) -> DynamicImage {
         let path = TEST_IMGS.join(img_name);
         let img = image::open(&path).unwrap();
-        fix_orientation(&img, &path).unwrap_or(img)
+        let exif = exif::Reader::new()
+            .read_from_container(&mut std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
+        match &exif {
+            Ok(exif) => fix_orientation(&img, &exif).unwrap_or(img),
+            Err(_) => img,
+        }
     }
 
     let img = image::open(TEST_IMGS.join("exif_1.jpg")).unwrap();

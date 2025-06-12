@@ -1,17 +1,24 @@
+use std::fmt;
 use std::fs;
 use std::fs::File;
+use std::hash::Hasher;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use config::Config;
 use errors::{anyhow, Context, Result};
+use exif::Exif;
 use libs::ahash::{HashMap, HashSet};
 use libs::image::codecs::avif::AvifEncoder;
 use libs::image::codecs::jpeg::JpegEncoder;
 use libs::image::imageops::FilterType;
-use libs::image::GenericImageView;
+use libs::image::{DynamicImage, GenericImageView};
 use libs::image::{EncodableLayout, ExtendedColorType, ImageEncoder, ImageFormat};
 use libs::rayon::prelude::*;
+use libs::sha2::Digest;
+use libs::sha2::Sha256;
 use libs::{image, webp};
 use serde::{Deserialize, Serialize};
 use utils::fs as ufs;
@@ -22,10 +29,92 @@ use crate::{fix_orientation, ImageMeta, ResizeInstructions, ResizeOperation};
 
 pub const RESIZED_SUBDIR: &str = "processed_images";
 
+pub struct ImageSource {
+    image: DynamicImage,
+    meta: ImageMeta,
+    exif: Option<Exif>,
+    checksum: [u8; 32],
+}
+
+impl ImageSource {
+    fn read(path: &Path) -> Result<Self> {
+        let image = image::open(&path)?;
+        let meta = ImageMeta::read(&path)
+            .with_context(|| format!("Failed to read image: {}", path.display()))?;
+        let exif = exif::Reader::new()
+            .read_from_container(&mut std::io::BufReader::new(std::fs::File::open(&path)?))
+            .ok();
+        let checksum: [u8; 32] = Sha256::digest(fs::read(&path)?).into();
+
+        Ok(ImageSource { image, meta, exif, checksum })
+    }
+}
+
+impl std::cmp::PartialEq for ImageSource {
+    fn eq(&self, other: &ImageSource) -> bool {
+        // If the file checksum is equal, everything else must be equal.
+        self.checksum == other.checksum
+    }
+}
+
+impl std::cmp::Eq for ImageSource {}
+
+impl std::hash::Hash for ImageSource {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // A hash of the file checksum is (for our purposes) as unique as a hash of the file itself.
+        self.checksum.hash(state)
+    }
+}
+
+impl fmt::Debug for ImageSource {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        f.debug_struct("ImageSource")
+            .field("image", &self.image)
+            .field("meta", &self.meta)
+            .field(
+                "exif",
+                match &self.exif {
+                    Some(exif) => &"HAS EXIF (FIXME)",
+                    None => &"NO EXIF (FIXME)",
+                },
+            )
+            .field("checksum", &self.checksum)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct ImageSourceCache {
+    cache_mutex: Mutex<HashMap<PathBuf, Arc<ImageSource>>>,
+}
+
+impl ImageSourceCache {
+    pub fn new() -> Self {
+        ImageSourceCache { cache_mutex: Mutex::new(HashMap::default()) }
+    }
+
+    pub fn read(&mut self, path: &Path) -> Result<Arc<ImageSource>> {
+        // Take the cache mutex
+        let mut cache = self
+            .cache_mutex
+            .lock()
+            .map_err(|lock_err| anyhow!("Failed to get lock: {}", lock_err.to_string()))?;
+        if cache.contains_key(path) {
+            // Return a clone of the cached source Arc
+            Ok(cache[path].clone())
+        } else {
+            // Read the source for the first time into a new Arc; clone it into the cache and return it
+            let new_source = Arc::new(ImageSource::read(path)?);
+            cache.insert(path.to_path_buf(), new_source.clone());
+            Ok(new_source)
+        }
+    }
+}
+
 /// Holds all data needed to perform a resize operation
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ImageOp {
-    input_path: PathBuf,
+    source: Arc<ImageSource>,
     output_path: PathBuf,
     instr: ResizeInstructions,
     format: Format,
@@ -41,8 +130,12 @@ impl ImageOp {
             return Ok(());
         }
 
-        let img = image::open(&self.input_path)?;
-        let mut img = fix_orientation(&img, &self.input_path).unwrap_or(img);
+        let mut img = match &self.source.exif {
+            Some(exif) => {
+                fix_orientation(&self.source.image, &exif).unwrap_or(self.source.image.clone())
+            }
+            None => self.source.image.clone(),
+        };
 
         let img = match self.instr.crop_instruction {
             Some((x, y, w, h)) => img.crop(x, y, w, h),
@@ -142,8 +235,7 @@ pub struct Processor {
     base_url: String,
     output_dir: PathBuf,
     img_ops: HashSet<ImageOp>,
-    /// We want to make sure we only ever get metadata for an image once
-    meta_cache: HashMap<PathBuf, ImageMeta>,
+    source_cache: ImageSourceCache,
 }
 
 impl Processor {
@@ -152,7 +244,7 @@ impl Processor {
             output_dir: base_path.join("static").join(RESIZED_SUBDIR),
             base_url: config.make_permalink(RESIZED_SUBDIR),
             img_ops: HashSet::default(),
-            meta_cache: HashMap::default(),
+            source_cache: ImageSourceCache::new(),
         }
     }
 
@@ -172,30 +264,18 @@ impl Processor {
         quality: Option<u8>,
         speed: Option<u8>,
     ) -> Result<EnqueueResponse> {
-        // First we load metadata from the cache if possible, otherwise from the file itself
-        if !self.meta_cache.contains_key(&input_path) {
-            let meta = ImageMeta::read(&input_path)
-                .with_context(|| format!("Failed to read image: {}", input_path.display()))?;
-            self.meta_cache.insert(input_path.clone(), meta);
-        }
-        // We will have inserted it just above
-        let meta = &self.meta_cache[&input_path];
+        let source = self.source_cache.read(&input_path)?;
+
         // We get the output format
-        let format = Format::from_args(meta.is_lossy(), format, quality, speed)?;
+        let format = Format::from_args(source.meta.is_lossy(), format, quality, speed)?;
         // Now we have all the data we need to generate the output filename and the response
-        let filename = get_processed_filename(&input_path, &op, &format)?;
+        let filename = get_processed_filename(&source, &op, &format)?;
         let url = format!("{}{}", self.base_url, filename);
         let static_path = Path::new("static").join(RESIZED_SUBDIR).join(&filename);
         let output_path = self.output_dir.join(&filename);
-        let instr = ResizeInstructions::new(op, meta.size);
-        let enqueue_response = EnqueueResponse::new(url, static_path, meta, &instr);
-        let img_op = ImageOp {
-            ignore: output_path.exists() && !ufs::file_stale(&input_path, &output_path),
-            input_path,
-            output_path,
-            instr,
-            format,
-        };
+        let instr = ResizeInstructions::new(op, source.meta.size);
+        let enqueue_response = EnqueueResponse::new(url, static_path, &source.meta, &instr);
+        let img_op = ImageOp { ignore: output_path.exists(), source, output_path, instr, format };
         self.img_ops.insert(img_op);
 
         Ok(enqueue_response)
